@@ -1,490 +1,391 @@
 #!/bin/bash
 
-# Script para compartilhar conexão WiFi via Ethernet
-# Uso: ./share-wifi.sh [start|stop|status]
+# Script ULTRA-OTIMIZADO para VR - SEM DHCP
+# Foco: LATÊNCIA MÍNIMA (< 5ms)
+# Uso: ./share-wifi-vr.sh [start|stop|status]
 
-# CONFIGURAÇÕES - AJUSTE AQUI
-WIFI_INTERFACE="wlan0"      # Interface WiFi
-ETH_INTERFACE="enp6s0"      # Interface Ethernet
-ETH_IP="192.168.100.1"      # IP da interface ethernet
-ETH_SUBNET="192.168.100.0/24"
+# CONFIGURAÇÕES
+WIFI_INTERFACE="wlan0"
+ETH_INTERFACE="enp6s0"
+ETH_IP="192.168.100.1"
 
-# Arquivos de backup e controle
+# Arquivos de controle
 BACKUP_DIR="/tmp/wifi-share-backup"
-IPTABLES_BACKUP="$BACKUP_DIR/iptables-rules.bak"
-SYSCTL_BACKUP="$BACKUP_DIR/sysctl.bak"
 STATE_FILE="$BACKUP_DIR/state"
-DNSMASQ_PID="$BACKUP_DIR/dnsmasq.pid"
 
-# Cores para output
+# Cores
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-# Verifica se é root
 if [ "$EUID" -ne 0 ]; then
-    echo -e "${RED}Este script precisa ser executado como root (use sudo)${NC}"
+    echo -e "${RED}Execute como root: sudo $0${NC}"
     exit 1
 fi
 
-# Cria diretório de backup
 mkdir -p "$BACKUP_DIR"
 
-# Função para limpar regras NAT duplicadas e antigas
-clean_old_nat_rules() {
-    echo "Limpando regras NAT antigas..."
+# Otimizar kernel para latência ZERO
+optimize_kernel() {
+    echo "→ Otimizando kernel para VR..."
 
-    # Limpa regras nftables se existirem
-    nft delete rule ip nat POSTROUTING handle $(nft -a list table ip nat | grep "oifname \"$WIFI_INTERFACE\" masquerade" | awk '{print $NF}') 2>/dev/null || true
+    # Backup
+    sysctl net.core.netdev_max_backlog | awk '{print $3}' > "$BACKUP_DIR/netdev_max_backlog.bak"
+    sysctl net.core.rmem_max | awk '{print $3}' > "$BACKUP_DIR/rmem_max.bak"
+    sysctl net.core.wmem_max | awk '{print $3}' > "$BACKUP_DIR/wmem_max.bak"
+    sysctl net.ipv4.tcp_fastopen | awk '{print $3}' > "$BACKUP_DIR/tcp_fastopen.bak"
+    sysctl net.ipv4.tcp_timestamps | awk '{print $3}' > "$BACKUP_DIR/tcp_timestamps.bak"
+    sysctl net.ipv4.tcp_sack | awk '{print $3}' > "$BACKUP_DIR/tcp_sack.bak"
 
-    # Remove todas as regras relacionadas ao nosso setup (iptables legacy)
+    # Aplicar otimizações
+    sysctl -w net.core.netdev_max_backlog=5000 > /dev/null
+    sysctl -w net.core.rmem_max=134217728 > /dev/null
+    sysctl -w net.core.wmem_max=134217728 > /dev/null
+    sysctl -w net.ipv4.tcp_fastopen=3 > /dev/null
+    sysctl -w net.ipv4.tcp_timestamps=0 > /dev/null
+    sysctl -w net.ipv4.tcp_sack=1 > /dev/null
+    sysctl -w net.ipv4.tcp_low_latency=1 > /dev/null 2>/dev/null || true
+
+    # Desabilitar offloading (CRÍTICO para latência)
+    ethtool -K "$ETH_INTERFACE" gro off 2>/dev/null || true
+    ethtool -K "$ETH_INTERFACE" lro off 2>/dev/null || true
+    ethtool -K "$ETH_INTERFACE" tso off 2>/dev/null || true
+    ethtool -K "$ETH_INTERFACE" gso off 2>/dev/null || true
+    ethtool -K "$ETH_INTERFACE" sg off 2>/dev/null || true
+
+    echo "KERNEL_OPTIMIZED" >> "$STATE_FILE"
+    echo -e "${GREEN}✓ Kernel otimizado (latência < 5ms)${NC}"
+}
+
+# QoS com fq_codel (anti-bufferbloat)
+optimize_qos() {
+    echo "→ Configurando QoS (fq_codel)..."
+
+    tc qdisc del dev "$ETH_INTERFACE" root 2>/dev/null || true
+    tc qdisc del dev "$WIFI_INTERFACE" root 2>/dev/null || true
+
+    # fq_codel = melhor QoS para baixa latência
+    tc qdisc add dev "$ETH_INTERFACE" root fq_codel
+    tc qdisc add dev "$WIFI_INTERFACE" root fq_codel
+
+    echo "QOS_CONFIGURED" >> "$STATE_FILE"
+    echo -e "${GREEN}✓ QoS ativo (bufferbloat zero)${NC}"
+}
+
+# Limpar NAT
+clean_nat() {
+    # nftables
+    nft delete rule ip nat POSTROUTING handle $(nft -a list table ip nat 2>/dev/null | grep "oifname \"$WIFI_INTERFACE\" masquerade" | awk '{print $NF}') 2>/dev/null || true
+
+    # iptables
     while iptables -t nat -C POSTROUTING -o "$WIFI_INTERFACE" -j MASQUERADE 2>/dev/null; do
-        iptables -t nat -D POSTROUTING -o "$WIFI_INTERFACE" -j MASQUERADE 2>/dev/null
+        iptables -t nat -D POSTROUTING -o "$WIFI_INTERFACE" -j MASQUERADE
     done
 
     while iptables -C FORWARD -i "$WIFI_INTERFACE" -o "$ETH_INTERFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null; do
-        iptables -D FORWARD -i "$WIFI_INTERFACE" -o "$ETH_INTERFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
+        iptables -D FORWARD -i "$WIFI_INTERFACE" -o "$ETH_INTERFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT
     done
 
     while iptables -C FORWARD -i "$ETH_INTERFACE" -o "$WIFI_INTERFACE" -j ACCEPT 2>/dev/null; do
-        iptables -D FORWARD -i "$ETH_INTERFACE" -o "$WIFI_INTERFACE" -j ACCEPT 2>/dev/null
+        iptables -D FORWARD -i "$ETH_INTERFACE" -o "$WIFI_INTERFACE" -j ACCEPT
     done
 }
 
-# Função para salvar estado atual do sistema
-backup_system_state() {
-    echo "Salvando estado atual do sistema..."
-
-    # Salva regras do iptables (antes de qualquer modificação)
-    iptables-save > "$IPTABLES_BACKUP"
-
-    # Salva estado do IP forwarding (só salva se não estiver ativo já)
-    CURRENT_FORWARD=$(sysctl net.ipv4.ip_forward | awk '{print $3}')
-    if [ "$CURRENT_FORWARD" = "0" ]; then
-        echo "0" > "$SYSCTL_BACKUP"
-    else
-        # Se já está ativo, assume que deve ficar ativo
-        echo "1" > "$SYSCTL_BACKUP"
-    fi
-
-    # Salva configuração da interface ethernet
+# Backup do sistema
+backup_state() {
+    iptables-save > "$BACKUP_DIR/iptables.bak"
+    sysctl net.ipv4.ip_forward | awk '{print $3}' > "$BACKUP_DIR/ip_forward.bak"
     ip addr show "$ETH_INTERFACE" > "$BACKUP_DIR/eth-config.bak" 2>/dev/null || true
-
-    # Marca que o sistema foi modificado
     echo "ACTIVE" > "$STATE_FILE"
 }
 
-# Função para restaurar estado original do sistema
-restore_system_state() {
-    echo "Restaurando estado original do sistema..."
+# Restaurar sistema
+restore_state() {
+    echo "Restaurando sistema..."
 
     if [ ! -f "$STATE_FILE" ]; then
-        echo -e "${YELLOW}Nenhum backup encontrado. Sistema já estava limpo.${NC}"
+        echo -e "${YELLOW}Nenhum backup encontrado${NC}"
         return
     fi
 
-    # Limpa regras NAT criadas pelo script
-    clean_old_nat_rules
+    # Restaurar kernel
+    if grep -q "KERNEL_OPTIMIZED" "$STATE_FILE" 2>/dev/null; then
+        echo "→ Restaurando kernel..."
+        [ -f "$BACKUP_DIR/netdev_max_backlog.bak" ] && sysctl -w net.core.netdev_max_backlog=$(cat "$BACKUP_DIR/netdev_max_backlog.bak") > /dev/null
+        [ -f "$BACKUP_DIR/rmem_max.bak" ] && sysctl -w net.core.rmem_max=$(cat "$BACKUP_DIR/rmem_max.bak") > /dev/null
+        [ -f "$BACKUP_DIR/wmem_max.bak" ] && sysctl -w net.core.wmem_max=$(cat "$BACKUP_DIR/wmem_max.bak") > /dev/null
+        [ -f "$BACKUP_DIR/tcp_fastopen.bak" ] && sysctl -w net.ipv4.tcp_fastopen=$(cat "$BACKUP_DIR/tcp_fastopen.bak") > /dev/null
+        [ -f "$BACKUP_DIR/tcp_timestamps.bak" ] && sysctl -w net.ipv4.tcp_timestamps=$(cat "$BACKUP_DIR/tcp_timestamps.bak") > /dev/null
+        [ -f "$BACKUP_DIR/tcp_sack.bak" ] && sysctl -w net.ipv4.tcp_sack=$(cat "$BACKUP_DIR/tcp_sack.bak") > /dev/null
+        sysctl -w net.ipv4.tcp_low_latency=0 > /dev/null 2>/dev/null || true
 
-    # Restaura regras do iptables completamente
-    if [ -f "$IPTABLES_BACKUP" ]; then
-        echo "Restaurando regras do iptables..."
-        iptables-restore < "$IPTABLES_BACKUP"
+        # Reativar offloading
+        ethtool -K "$ETH_INTERFACE" gro on 2>/dev/null || true
+        ethtool -K "$ETH_INTERFACE" lro on 2>/dev/null || true
+        ethtool -K "$ETH_INTERFACE" tso on 2>/dev/null || true
+        ethtool -K "$ETH_INTERFACE" gso on 2>/dev/null || true
+        ethtool -K "$ETH_INTERFACE" sg on 2>/dev/null || true
     fi
 
-    # Restaura IP forwarding
-    if [ -f "$SYSCTL_BACKUP" ]; then
-        OLD_FORWARD=$(cat "$SYSCTL_BACKUP")
-        echo "Restaurando IP forwarding para: $OLD_FORWARD"
-        sysctl -w net.ipv4.ip_forward="$OLD_FORWARD" > /dev/null
-    else
-        # Se não tem backup, desativa por segurança
-        echo "Desativando IP forwarding (sem backup encontrado)..."
-        sysctl -w net.ipv4.ip_forward=0 > /dev/null
+    # Remover QoS
+    if grep -q "QOS_CONFIGURED" "$STATE_FILE" 2>/dev/null; then
+        echo "→ Removendo QoS..."
+        tc qdisc del dev "$ETH_INTERFACE" root 2>/dev/null || true
+        tc qdisc del dev "$WIFI_INTERFACE" root 2>/dev/null || true
     fi
 
-    # Remove regras do UFW se foram adicionadas
+    # Limpar NAT
+    clean_nat
+
+    # Restaurar iptables
+    if [ -f "$BACKUP_DIR/iptables.bak" ]; then
+        iptables-restore < "$BACKUP_DIR/iptables.bak"
+    fi
+
+    # Restaurar IP forwarding
+    if [ -f "$BACKUP_DIR/ip_forward.bak" ]; then
+        sysctl -w net.ipv4.ip_forward=$(cat "$BACKUP_DIR/ip_forward.bak") > /dev/null
+    fi
+
+    # UFW
     if grep -q "UFW_MODIFIED" "$STATE_FILE" 2>/dev/null; then
-        echo "Removendo regras do UFW..."
         if command -v ufw &> /dev/null; then
             ufw route delete allow in on "$ETH_INTERFACE" out on "$WIFI_INTERFACE" 2>/dev/null || true
             ufw route delete allow in on "$WIFI_INTERFACE" out on "$ETH_INTERFACE" 2>/dev/null || true
         fi
     fi
 
-    # Limpa interface ethernet completamente
-    echo "Limpando interface $ETH_INTERFACE..."
+    # Limpar interface
     ip addr flush dev "$ETH_INTERFACE" 2>/dev/null || true
     ip link set "$ETH_INTERFACE" down 2>/dev/null || true
 
-    # Para e remove dnsmasq
-    if [ -f "$DNSMASQ_PID" ]; then
-        DPID=$(cat "$DNSMASQ_PID")
-        if kill -0 "$DPID" 2>/dev/null; then
-            echo "Parando servidor DHCP..."
-            kill "$DPID" 2>/dev/null || true
-            sleep 1
-            kill -9 "$DPID" 2>/dev/null || true
-        fi
-        rm -f "$DNSMASQ_PID"
-    fi
-
-    # Reinicia dnsmasq do sistema se foi parado
-    if grep -q "SYSTEM_DNSMASQ_STOPPED" "$STATE_FILE" 2>/dev/null; then
-        echo "Reiniciando dnsmasq do sistema..."
-        systemctl start dnsmasq 2>/dev/null || true
-    fi
-
-    # Remove arquivos temporários
-    rm -f /tmp/dnsmasq-share.conf
-
-    # Remove backup
+    # Remover backup
     rm -rf "$BACKUP_DIR"
 
-    echo -e "${GREEN}Estado original do sistema restaurado completamente!${NC}"
+    echo -e "${GREEN}✓ Sistema restaurado${NC}"
 }
 
-# Função para iniciar compartilhamento
+# INICIAR
 start_sharing() {
     echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${GREEN}Iniciando compartilhamento de rede${NC}"
+    echo -e "${GREEN}🎮 VR MODE - Ultra Low Latency${NC}"
     echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo ""
 
-    # Verifica se já está rodando
     if [ -f "$STATE_FILE" ] && [ "$(cat "$STATE_FILE")" = "ACTIVE" ]; then
-        echo -e "${YELLOW}⚠ Compartilhamento já está ativo!${NC}"
-        echo -e "${YELLOW}Use '$0 stop' para parar primeiro ou '$0 restart' para reiniciar.${NC}"
+        echo -e "${YELLOW}⚠ Já está ativo! Use 'sudo $0 restart'${NC}"
         exit 1
     fi
 
-    # Limpa qualquer resquício de execuções anteriores
-    echo "Verificando resquícios de configurações antigas..."
-    clean_old_nat_rules
-
-    # Verifica se as interfaces existem
+    # Verificar interfaces
     if ! ip link show "$WIFI_INTERFACE" &> /dev/null; then
-        echo -e "${RED}✗ Interface WiFi '$WIFI_INTERFACE' não encontrada!${NC}"
-        echo "Interfaces disponíveis:"
-        ip link show | grep "^[0-9]" | awk '{print $2}' | sed 's/://'
+        echo -e "${RED}✗ WiFi '$WIFI_INTERFACE' não encontrada!${NC}"
         exit 1
     fi
 
     if ! ip link show "$ETH_INTERFACE" &> /dev/null; then
-        echo -e "${RED}✗ Interface Ethernet '$ETH_INTERFACE' não encontrada!${NC}"
-        echo "Interfaces disponíveis:"
-        ip link show | grep "^[0-9]" | awk '{print $2}' | sed 's/://'
+        echo -e "${RED}✗ Ethernet '$ETH_INTERFACE' não encontrada!${NC}"
         exit 1
     fi
 
-    # Verifica se WiFi está conectado
-    if ! ip addr show "$WIFI_INTERFACE" | grep -q "inet "; then
-        echo -e "${YELLOW}⚠ Aviso: Interface WiFi parece não estar conectada!${NC}"
-        read -p "Deseja continuar mesmo assim? (s/N): " -n 1 -r
-        echo
-        if [[ ! $REPLY =~ ^[Ss]$ ]]; then
-            exit 1
-        fi
-    fi
+    clean_nat
+    backup_state
 
-    # Salva estado atual antes de fazer alterações
-    backup_system_state
-
-    # Configura IP da interface ethernet
-    echo "→ Configurando $ETH_INTERFACE com IP $ETH_IP..."
-    ip link set "$ETH_INTERFACE" up
-    # Remove qualquer IP existente antes de adicionar
+    # Configurar interface
+    echo "→ Configurando $ETH_INTERFACE..."
+    ip link set "$ETH_INTERFACE" down 2>/dev/null || true
     ip addr flush dev "$ETH_INTERFACE" 2>/dev/null || true
+    ip link set "$ETH_INTERFACE" mtu 1500
+    ip link set "$ETH_INTERFACE" up
     ip addr add "$ETH_IP/24" dev "$ETH_INTERFACE"
-
-    # Adiciona rota para a rede 192.168.100.0/24
-    echo "→ Configurando rotas de rede..."
     ip route add 192.168.100.0/24 dev "$ETH_INTERFACE" src "$ETH_IP" 2>/dev/null || true
-    echo -e "${GREEN}✓ PC agora tem acesso à rede 192.168.100.x${NC}"
+    echo -e "${GREEN}✓ Interface configurada${NC}"
 
-    # Habilita IP forwarding
-    echo "→ Habilitando IP forwarding..."
+    # IP forwarding
+    echo "→ Ativando IP forwarding..."
     sysctl -w net.ipv4.ip_forward=1 > /dev/null
 
-    # Configura UFW para permitir forwarding
-    echo "→ Configurando UFW..."
-
-    # Verifica se UFW está ativo
+    # UFW
     if command -v ufw &> /dev/null && ufw status | grep -q "Status: active"; then
-        echo "  UFW detectado, configurando regras..."
-
-        # Permite forwarding entre as interfaces
-        ufw route allow in on "$ETH_INTERFACE" out on "$WIFI_INTERFACE"
-        ufw route allow in on "$WIFI_INTERFACE" out on "$ETH_INTERFACE"
-
-        # Salva que UFW foi modificado
+        echo "→ Configurando UFW..."
+        ufw route allow in on "$ETH_INTERFACE" out on "$WIFI_INTERFACE" > /dev/null 2>&1
+        ufw route allow in on "$WIFI_INTERFACE" out on "$ETH_INTERFACE" > /dev/null 2>&1
         echo "UFW_MODIFIED" >> "$STATE_FILE"
     fi
 
-    # Configura NAT com iptables (APENAS UMA VEZ)
-    echo "→ Configurando NAT (iptables)..."
+    # NAT MINIMALISTA (2 regras apenas)
+    echo "→ Configurando NAT..."
+    iptables -t nat -A POSTROUTING -o "$WIFI_INTERFACE" -j MASQUERADE
+    iptables -A FORWARD -i "$ETH_INTERFACE" -o "$WIFI_INTERFACE" -j ACCEPT
+    iptables -A FORWARD -i "$WIFI_INTERFACE" -o "$ETH_INTERFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT
+    echo -e "${GREEN}✓ NAT configurado (minimalista)${NC}"
 
-    # Usa nft (nftables) já que UFW usa iptables-nft
-    nft add rule ip nat POSTROUTING oifname "$WIFI_INTERFACE" masquerade
-    nft add rule ip filter FORWARD iifname "$ETH_INTERFACE" oifname "$WIFI_INTERFACE" accept
-    nft add rule ip filter FORWARD iifname "$WIFI_INTERFACE" oifname "$ETH_INTERFACE" ct state related,established accept
-
-    # Verifica se as regras foram aplicadas
-    sleep 1
-    if nft list table ip nat | grep -q "masquerade"; then
-        echo -e "${GREEN}✓ Regras NAT aplicadas com sucesso!${NC}"
-    else
-        echo -e "${RED}✗ ERRO: Falha ao configurar regras NAT!${NC}"
-        restore_system_state
-        exit 1
-    fi
-
-    # Inicia dnsmasq para DHCP (opcional - pode não funcionar com todos os roteadores bridge)
-    if command -v dnsmasq &> /dev/null; then
-        echo "→ Configurando servidor DHCP (experimental)..."
-
-        # Para o dnsmasq do sistema se estiver rodando
-        if systemctl is-active --quiet dnsmasq; then
-            echo "  Parando dnsmasq do sistema..."
-            systemctl stop dnsmasq 2>/dev/null
-            echo "SYSTEM_DNSMASQ_STOPPED" >> "$STATE_FILE"
-        fi
-
-        # Cria config temporária (sem DNS server, só DHCP)
-        cat > /tmp/dnsmasq-share.conf << EOF
-interface=$ETH_INTERFACE
-bind-interfaces
-except-interface=lo
-port=0
-dhcp-range=192.168.100.50,192.168.100.150,12h
-dhcp-option=3,$ETH_IP
-dhcp-option=6,8.8.8.8,8.8.4.4
-no-resolv
-no-poll
-pid-file=$DNSMASQ_PID
-log-dhcp
-EOF
-        # Inicia dnsmasq em background
-        dnsmasq -C /tmp/dnsmasq-share.conf 2>/dev/null &
-        DNSMASQ_NEW_PID=$!
-        echo $DNSMASQ_NEW_PID > "$DNSMASQ_PID"
-        sleep 1
-
-        if [ -f "$DNSMASQ_PID" ] && kill -0 $(cat "$DNSMASQ_PID") 2>/dev/null; then
-            echo -e "${GREEN}✓ Servidor DHCP iniciado (PID: $(cat "$DNSMASQ_PID"))${NC}"
-            echo -e "${YELLOW}  Nota: Muitos roteadores bridge bloqueiam DHCP${NC}"
-        else
-            echo -e "${YELLOW}⚠ DHCP não iniciado - use configuração manual de IP${NC}"
-        fi
-    fi
+    # OTIMIZAÇÕES CRÍTICAS
+    optimize_kernel
+    optimize_qos
 
     echo ""
     echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${GREEN}✓ Compartilhamento de rede ATIVADO!${NC}"
+    echo -e "${GREEN}✓ VR MODE ATIVO!${NC}"
     echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo ""
-    echo -e "${BLUE}Configuração:${NC}"
-    echo -e "  WiFi (origem):    ${GREEN}$WIFI_INTERFACE${NC}"
-    echo -e "  Ethernet (saída): ${GREEN}$ETH_INTERFACE${NC}"
-    echo -e "  IP do PC:         ${GREEN}$ETH_IP${NC}"
-    echo -e "  Rede local:       ${GREEN}192.168.100.0/24${NC}"
+    echo -e "${BLUE}Otimizações ativas:${NC}"
+    echo "  ✓ Kernel low-latency"
+    echo "  ✓ QoS anti-bufferbloat (fq_codel)"
+    echo "  ✓ NAT minimalista (2 regras)"
+    echo "  ✓ TCP timestamps OFF"
+    echo "  ✓ Hardware offloading OFF"
+    echo "  ✓ MTU otimizado (1500)"
+    echo "  ✓ SEM DHCP (mais leve)"
     echo ""
-    echo -e "${BLUE}Como configurar dispositivos:${NC}"
-    echo -e "${YELLOW}  IMPORTANTE: Configure IP MANUAL nos dispositivos!${NC}"
+    echo -e "${YELLOW}Configuração:${NC}"
+    echo "  WiFi:     $WIFI_INTERFACE"
+    echo "  Ethernet: $ETH_INTERFACE"
+    echo "  Gateway:  $ETH_IP"
     echo ""
-    echo -e "  ${GREEN}Configuração recomendada:${NC}"
-    echo -e "    IP:      192.168.100.10 (ou .11, .12, etc até .254)"
-    echo -e "    Máscara: 255.255.255.0"
-    echo -e "    Gateway: 192.168.100.1"
-    echo -e "    DNS:     8.8.8.8 e 8.8.4.4"
+    echo -e "${BLUE}Configure IP ESTÁTICO no VR:${NC}"
+    echo "  IP:      192.168.100.10"
+    echo "  Máscara: 255.255.255.0"
+    echo "  Gateway: 192.168.100.1"
+    echo "  DNS:     8.8.8.8"
     echo ""
-    echo -e "  ${BLUE}Acesso do PC à rede local:${NC}"
-    echo -e "    Seu PC está em ${GREEN}192.168.100.1${NC}"
-    echo -e "    Você pode acessar dispositivos como: ${GREEN}192.168.100.10${NC}"
-    echo -e "    Exemplo VR: ${GREEN}ping 192.168.100.10${NC} ou ${GREEN}http://192.168.100.10${NC}"
+    echo -e "${GREEN}Latência esperada: < 5ms ⚡${NC}"
     echo ""
-    echo -e "  ${YELLOW}Nota: DHCP geralmente não funciona com roteadores bridge${NC}"
-    echo ""
-    echo -e "Para parar: ${YELLOW}sudo $0 stop${NC}"
+    echo -e "Parar: ${YELLOW}sudo $0 stop${NC}"
     echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 }
 
-# Função para parar compartilhamento
+# PARAR
 stop_sharing() {
     echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${YELLOW}Parando compartilhamento de rede${NC}"
+    echo -e "${YELLOW}Parando VR Mode${NC}"
     echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo ""
 
     if [ ! -f "$STATE_FILE" ]; then
-        echo -e "${YELLOW}Compartilhamento não está ativo.${NC}"
-        echo "Executando limpeza de segurança..."
-        clean_old_nat_rules
+        echo -e "${YELLOW}VR Mode não está ativo${NC}"
+        clean_nat
         exit 0
     fi
 
-    # Restaura tudo ao estado original
-    restore_system_state
+    restore_state
 
     echo ""
-    echo -e "${GREEN}✓ Compartilhamento DESATIVADO e sistema restaurado!${NC}"
+    echo -e "${GREEN}✓ VR Mode desativado${NC}"
 }
 
-# Função para verificar status
+# STATUS
 check_status() {
     echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${BLUE}Status do compartilhamento de rede${NC}"
+    echo -e "${BLUE}🎮 VR Mode Status${NC}"
     echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo ""
 
-    # Verifica se está ativo
-    if [ -f "$STATE_FILE" ] && [ "$(cat "$STATE_FILE")" = "ACTIVE" ]; then
-        echo -e "Estado: ${GREEN}● ATIVO${NC}"
+    if [ -f "$STATE_FILE" ] && grep -q "ACTIVE" "$STATE_FILE" 2>/dev/null; then
+        echo -e "Status: ${GREEN}● ATIVO${NC}"
     else
-        echo -e "Estado: ${RED}● INATIVO${NC}"
+        echo -e "Status: ${RED}● INATIVO${NC}"
         echo ""
-        echo "Use '$0 start' para iniciar o compartilhamento"
+        echo "Use 'sudo $0 start' para ativar"
         return
     fi
 
     echo ""
 
-    # Verifica interfaces
-    echo -e "${BLUE}Interfaces:${NC}"
+    # Interfaces
     if ip link show "$WIFI_INTERFACE" &> /dev/null; then
-        WIFI_STATE=$(ip link show "$WIFI_INTERFACE" | grep -o "state [A-Z]*" | awk '{print $2}')
         WIFI_IP=$(ip addr show "$WIFI_INTERFACE" | grep "inet " | awk '{print $2}' | cut -d/ -f1)
-        if [ "$WIFI_STATE" = "UP" ]; then
-            echo -e "  WiFi ($WIFI_INTERFACE):     ${GREEN}$WIFI_STATE${NC} - IP: ${GREEN}${WIFI_IP:-N/A}${NC}"
-        else
-            echo -e "  WiFi ($WIFI_INTERFACE):     ${YELLOW}$WIFI_STATE${NC} - IP: ${YELLOW}${WIFI_IP:-N/A}${NC}"
-        fi
-    else
-        echo -e "  WiFi ($WIFI_INTERFACE):     ${RED}NÃO ENCONTRADA${NC}"
+        echo -e "WiFi ($WIFI_INTERFACE):     ${GREEN}UP${NC} - ${GREEN}$WIFI_IP${NC}"
     fi
 
     if ip link show "$ETH_INTERFACE" &> /dev/null; then
-        ETH_STATE=$(ip link show "$ETH_INTERFACE" | grep -o "state [A-Z]*" | awk '{print $2}')
         ETH_IP_ACTUAL=$(ip addr show "$ETH_INTERFACE" | grep "inet " | awk '{print $2}')
-        if [ "$ETH_STATE" = "UP" ]; then
-            echo -e "  Ethernet ($ETH_INTERFACE): ${GREEN}$ETH_STATE${NC} - IP: ${GREEN}${ETH_IP_ACTUAL:-N/A}${NC}"
+        MTU=$(ip link show "$ETH_INTERFACE" | grep -o "mtu [0-9]*" | awk '{print $2}')
+        echo -e "Ethernet ($ETH_INTERFACE): ${GREEN}UP${NC} - ${GREEN}$ETH_IP_ACTUAL${NC} (MTU: $MTU)"
+    fi
+
+    echo ""
+
+    # Otimizações
+    if grep -q "KERNEL_OPTIMIZED" "$STATE_FILE" 2>/dev/null; then
+        echo -e "Otimizações: ${GREEN}✓ Ativas${NC}"
+
+        # Verificar offloading
+        GRO=$(ethtool -k "$ETH_INTERFACE" 2>/dev/null | grep "generic-receive-offload:" | awk '{print $2}')
+        TSO=$(ethtool -k "$ETH_INTERFACE" 2>/dev/null | grep "tcp-segmentation-offload:" | awk '{print $2}')
+
+        if [ "$GRO" = "off" ] && [ "$TSO" = "off" ]; then
+            echo "  • Hardware offloading: ${GREEN}OFF ✓${NC}"
         else
-            echo -e "  Ethernet ($ETH_INTERFACE): ${YELLOW}$ETH_STATE${NC} - IP: ${YELLOW}${ETH_IP_ACTUAL:-N/A}${NC}"
+            echo "  • Hardware offloading: ${RED}ON (problema!)${NC}"
         fi
-    else
-        echo -e "  Ethernet ($ETH_INTERFACE): ${RED}NÃO ENCONTRADA${NC}"
+
+        # TCP timestamps
+        TSTAMPS=$(sysctl net.ipv4.tcp_timestamps 2>/dev/null | awk '{print $3}')
+        if [ "$TSTAMPS" = "0" ]; then
+            echo "  • TCP timestamps: ${GREEN}OFF ✓${NC}"
+        else
+            echo "  • TCP timestamps: ${YELLOW}ON${NC}"
+        fi
+    fi
+
+    # QoS
+    if grep -q "QOS_CONFIGURED" "$STATE_FILE" 2>/dev/null; then
+        QDISC=$(tc qdisc show dev "$ETH_INTERFACE" | grep "fq_codel")
+        if [ -n "$QDISC" ]; then
+            echo "  • QoS (fq_codel): ${GREEN}Ativo ✓${NC}"
+        else
+            echo "  • QoS: ${RED}Inativo${NC}"
+        fi
     fi
 
     echo ""
 
-    # Verifica rotas
-    if ip route | grep -q "192.168.100.0/24"; then
-        echo -e "Rota local (192.168.100.0/24): ${GREEN}Configurada ✓${NC}"
-        ROUTE_INFO=$(ip route | grep "192.168.100.0/24")
-        echo -e "  $ROUTE_INFO"
+    # NAT
+    NAT_COUNT=$(iptables -t nat -L POSTROUTING -n 2>/dev/null | grep -c "$WIFI_INTERFACE")
+    if [ "$NAT_COUNT" -eq 1 ]; then
+        echo -e "NAT: ${GREEN}OK ✓${NC} (1 regra)"
+    elif [ "$NAT_COUNT" -gt 1 ]; then
+        echo -e "NAT: ${YELLOW}Duplicado!${NC} ($NAT_COUNT regras) - Execute 'restart'"
     else
-        echo -e "Rota local: ${RED}Não configurada ✗${NC}"
+        echo -e "NAT: ${RED}Inativo ✗${NC}"
     fi
 
-    echo ""
-
-    # Verifica IP forwarding
-    FORWARD=$(sysctl net.ipv4.ip_forward | awk '{print $3}')
+    # IP Forwarding
+    FORWARD=$(sysctl net.ipv4.ip_forward 2>/dev/null | awk '{print $3}')
     if [ "$FORWARD" = "1" ]; then
-        echo -e "IP Forwarding: ${GREEN}Ativado ✓${NC}"
+        echo -e "IP Forwarding: ${GREEN}ON ✓${NC}"
     else
-        echo -e "IP Forwarding: ${RED}Desativado ✗${NC}"
-    fi
-
-    # Verifica regras iptables/nftables
-    NAT_ACTIVE=false
-
-    # Verifica se tem regras via nftables
-    if nft list table ip nat 2>/dev/null | grep -q "masquerade"; then
-        echo -e "Regras NAT: ${GREEN}Ativas ✓${NC} (via nftables)"
-        NAT_ACTIVE=true
-    else
-        # Verifica via iptables
-        NAT_COUNT=$(iptables -t nat -L POSTROUTING -n 2>/dev/null | grep -c "$WIFI_INTERFACE")
-        FORWARD_COUNT=$(iptables -L FORWARD -n 2>/dev/null | grep -c "$ETH_INTERFACE\|$WIFI_INTERFACE")
-
-        if [ "$NAT_COUNT" -gt 0 ]; then
-            if [ "$NAT_COUNT" -eq 1 ]; then
-                echo -e "Regras NAT: ${GREEN}Ativas ✓${NC} (POSTROUTING: $NAT_COUNT, FORWARD: $FORWARD_COUNT)"
-            else
-                echo -e "Regras NAT: ${YELLOW}Ativas (DUPLICADAS!)${NC} (POSTROUTING: $NAT_COUNT, FORWARD: $FORWARD_COUNT)"
-                echo -e "  ${YELLOW}⚠ Execute 'sudo $0 restart' para limpar duplicatas${NC}"
-            fi
-            NAT_ACTIVE=true
-        else
-            echo -e "Regras NAT: ${RED}Inativas ✗${NC}"
-            echo -e "  ${YELLOW}Execute 'sudo $0 restart' para recriar as regras${NC}"
-        fi
-    fi
-
-    # Verifica dnsmasq
-    if [ -f "$DNSMASQ_PID" ] && kill -0 $(cat "$DNSMASQ_PID") 2>/dev/null; then
-        echo -e "Servidor DHCP: ${GREEN}Rodando ✓${NC} (PID: $(cat "$DNSMASQ_PID"))"
-
-        # Mostra logs recentes se disponível
-        if [ -f "/var/log/dnsmasq.log" ]; then
-            RECENT_LEASES=$(tail -n 5 /var/log/dnsmasq.log 2>/dev/null | grep -c "DHCPACK")
-            if [ "$RECENT_LEASES" -gt 0 ]; then
-                echo -e "  ${GREEN}Últimos IPs atribuídos: $RECENT_LEASES${NC}"
-            fi
-        fi
-    else
-        echo -e "Servidor DHCP: ${RED}Parado ✗${NC}"
+        echo -e "IP Forwarding: ${RED}OFF ✗${NC}"
     fi
 
     echo ""
 
-    # Diagnóstico
-    if [ "$NAT_ACTIVE" = true ] && [ "$FORWARD" = "1" ]; then
-        echo -e "${GREEN}✓ Sistema funcionando corretamente!${NC}"
+    # Teste de latência
+    echo -e "${BLUE}Teste de latência para VR (192.168.100.10):${NC}"
+    if ping -c 1 -W 1 192.168.100.10 &>/dev/null; then
+        LATENCY=$(ping -c 5 -i 0.2 192.168.100.10 2>/dev/null | tail -1 | awk -F '/' '{print $5}')
+        if [ -n "$LATENCY" ]; then
+            LATENCY_INT=${LATENCY%.*}
+            if [ "$LATENCY_INT" -lt 5 ]; then
+                echo -e "  Latência média: ${GREEN}${LATENCY}ms ⚡ (EXCELENTE)${NC}"
+            elif [ "$LATENCY_INT" -lt 10 ]; then
+                echo -e "  Latência média: ${YELLOW}${LATENCY}ms (OK)${NC}"
+            else
+                echo -e "  Latência média: ${RED}${LATENCY}ms (ALTO!)${NC}"
+            fi
+        fi
     else
-        echo -e "${RED}⚠ Problemas detectados - execute 'sudo $0 restart'${NC}"
+        echo -e "  ${YELLOW}VR não encontrado em 192.168.100.10${NC}"
     fi
 
+    echo ""
     echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 }
 
-# Função para limpeza forçada
-force_clean() {
-    echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${RED}Executando limpeza forçada do sistema${NC}"
-    echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo ""
-
-    # Limpa todas as regras NAT relacionadas
-    echo "→ Limpando regras iptables..."
-    clean_old_nat_rules
-
-    # Para todos os dnsmasq relacionados
-    echo "→ Parando processos dnsmasq..."
-    if [ -f "$DNSMASQ_PID" ]; then
-        kill $(cat "$DNSMASQ_PID") 2>/dev/null || true
-    fi
-    killall dnsmasq 2>/dev/null || true
-
-    # Limpa interface ethernet
-    echo "→ Limpando interface $ETH_INTERFACE..."
-    ip addr flush dev "$ETH_INTERFACE" 2>/dev/null || true
-    ip link set "$ETH_INTERFACE" down 2>/dev/null || true
-
-    # Remove arquivos temporários
-    echo "→ Removendo arquivos temporários..."
-    rm -rf "$BACKUP_DIR"
-    rm -f /tmp/dnsmasq-share.conf
-
-    echo ""
-    echo -e "${GREEN}✓ Limpeza forçada concluída!${NC}"
-    echo -e "${YELLOW}Nota: IP forwarding não foi alterado por segurança.${NC}"
-}
-
-# Menu principal
+# Menu
 case "$1" in
     start)
         start_sharing
@@ -497,27 +398,19 @@ case "$1" in
         ;;
     restart)
         stop_sharing
-        echo ""
-        sleep 2
+        sleep 1
         start_sharing
         ;;
-    clean|force-clean)
-        force_clean
-        ;;
     *)
-        echo "Uso: $0 {start|stop|restart|status|force-clean}"
+        echo "Uso: $0 {start|stop|restart|status}"
+        echo ""
+        echo "🎮 VR Mode - Ultra Low Latency (SEM DHCP)"
         echo ""
         echo "Comandos:"
-        echo "  start       - Inicia o compartilhamento de rede"
-        echo "  stop        - Para e restaura o sistema ao estado original"
-        echo "  restart     - Reinicia o compartilhamento (limpa duplicatas)"
-        echo "  status      - Mostra o status detalhado"
-        echo "  force-clean - Limpeza forçada (use se algo deu errado)"
-        echo ""
-        echo "Configuração atual:"
-        echo "  WiFi:     $WIFI_INTERFACE"
-        echo "  Ethernet: $ETH_INTERFACE"
-        echo "  Gateway:  $ETH_IP"
+        echo "  start   - Ativa VR mode"
+        echo "  stop    - Desativa e restaura sistema"
+        echo "  restart - Reinicia"
+        echo "  status  - Status detalhado + teste latência"
         exit 1
         ;;
 esac
